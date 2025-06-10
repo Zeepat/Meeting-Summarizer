@@ -1,9 +1,10 @@
 import json
 import requests
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import sys
 import subprocess
 import time
+import re
 
 class MeetingSummarizer:
     def __init__(self, model: str = "gemma3:4b", api_base: str = "http://localhost:11434"):
@@ -15,15 +16,87 @@ class MeetingSummarizer:
         """
         self.model = model
         self.api_base = api_base.rstrip('/')
+        self.chunk_size = 2000  # Number of characters per chunk
+        self.chunk_overlap = 200  # Overlap between chunks to maintain context
         
         # Check if Ollama is running and properly set up
         self._check_ollama_setup()
+        
+    def _split_transcript(self, transcript: str) -> List[str]:
+        """Split a long transcript into overlapping chunks.
+        
+        Args:
+            transcript: The full transcript text
+            
+        Returns:
+            List of transcript chunks
+        """
+        # Split into sentences (roughly)
+        sentences = re.split(r'(?<=[.!?])\s+', transcript)
+        
+        chunks = []
+        current_chunk = []
+        current_length = 0
+        
+        for sentence in sentences:
+            sentence_length = len(sentence)
+            
+            # If adding this sentence would exceed chunk size, save current chunk
+            if current_length + sentence_length > self.chunk_size and current_chunk:
+                chunks.append(' '.join(current_chunk))
+                # Keep last few sentences for overlap
+                overlap_text = ' '.join(current_chunk[-3:])  # Keep last 3 sentences
+                current_chunk = [overlap_text, sentence] if overlap_text else [sentence]
+                current_length = len(overlap_text) + sentence_length if overlap_text else sentence_length
+            else:
+                current_chunk.append(sentence)
+                current_length += sentence_length
+        
+        # Add the last chunk if there's anything left
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+        
+        return chunks
+
+    def _merge_summaries(self, chunk_results: List[Dict]) -> Dict:
+        """Merge multiple chunk summaries into a single summary.
+        
+        Args:
+            chunk_results: List of summary dictionaries from each chunk
+            
+        Returns:
+            Merged summary dictionary
+        """
+        all_summaries = []
+        all_key_points = []
+        all_action_items = []
+        
+        for result in chunk_results:
+            if result["summary"]:
+                all_summaries.append(result["summary"])
+            all_key_points.extend(result["key_points"])
+            all_action_items.extend(result["action_items"])
+        
+        # Remove duplicates while preserving order
+        def deduplicate(items):
+            seen = set()
+            return [x for x in items if not (x.lower() in seen or seen.add(x.lower()))]
+        
+        final_summary = " ".join(all_summaries)
+        final_key_points = deduplicate(all_key_points)
+        final_action_items = deduplicate(all_action_items)
+        
+        return {
+            "summary": final_summary,
+            "key_points": final_key_points,
+            "action_items": final_action_items
+        }
         
     def _check_ollama_setup(self) -> None:
         """Check if Ollama is properly installed and running."""
         try:
             # Try to connect to Ollama
-            response = requests.get(f"{self.api_base}/api/tags")
+            response = requests.get(f"{self.api_base}/api/tags", timeout=5)
             response.raise_for_status()
             
             # Check if our model is available
@@ -62,6 +135,20 @@ class MeetingSummarizer:
         """
         for attempt in range(max_retries):
             try:
+                # First, try a simple completion to warm up the model
+                if attempt == 0:
+                    warmup_response = requests.post(
+                        f"{self.api_base}/api/generate",
+                        json={
+                            "model": self.model,
+                            "prompt": "Hello",
+                            "stream": False,
+                        },
+                        timeout=10
+                    )
+                    warmup_response.raise_for_status()
+                
+                # Now try the actual generation
                 response = requests.post(
                     f"{self.api_base}/api/generate",
                     json={
@@ -70,10 +157,11 @@ class MeetingSummarizer:
                         "stream": False,
                         "options": {
                             "temperature": 0.7,
-                            "top_p": 0.9
+                            "top_p": 0.9,
+                            "num_predict": 1024,  # Limit response length
                         }
                     },
-                    timeout=30  # Add timeout to prevent hanging
+                    timeout=60  # Increased timeout
                 )
                 response.raise_for_status()
                 return response.json()["response"]
@@ -103,36 +191,53 @@ class MeetingSummarizer:
                 "key_points": [],
                 "action_items": []
             }
+
+        # For short transcripts, process directly
+        if len(transcript) <= self.chunk_size:
+            return self._summarize_chunk(transcript, max_length)
             
-        # Create a detailed prompt for the model
-        prompt = f"""You are a professional meeting summarizer. Please analyze this meeting transcript carefully and provide:
+        # For long transcripts, split into chunks and process each
+        print("\nTranscript is long, processing in chunks...")
+        chunks = self._split_transcript(transcript)
+        chunk_results = []
+        
+        for i, chunk in enumerate(chunks, 1):
+            print(f"Processing chunk {i} of {len(chunks)}...")
+            result = self._summarize_chunk(chunk, max_length)
+            chunk_results.append(result)
+            
+        # Merge results from all chunks
+        print("Merging summaries...")
+        return self._merge_summaries(chunk_results)
 
-1. A concise but detailed summary of what happened in the meeting
-2. Key points that were discussed or actions that took place
-3. Any action items or next steps mentioned
+    def _summarize_chunk(self, text: str, max_length: Optional[int] = None) -> Dict:
+        """Summarize a single chunk of text.
+        
+        Args:
+            text: The text to summarize
+            max_length: Optional maximum length for the summary
+            
+        Returns:
+            Dict containing the summary and key points
+        """
+        prompt = f"""Summarize this meeting transcript concisely:
 
-Here is the meeting transcript to analyze:
----
-{transcript}
----
+{text}
 
-Please be specific and detailed in your analysis. Even if the transcript is short or contains partial information, extract as much meaningful content as possible.
+Format your response as:
+SUMMARY:
+[Write a brief summary]
 
-Format your response exactly as follows:
-Summary: [Write a paragraph summarizing the key events and discussions]
+KEY POINTS:
+- [Point 1]
+- [Point 2]
 
-Key Points:
-- [List each key point or event]
-- [Continue with more points]
-
-Action Items:
-- [List any action items or next steps]
-- [Continue with more items]
-
-If there are no clear action items, you can omit that section. Focus on providing accurate, meaningful information based on what's in the transcript."""
+ACTION ITEMS:
+- [Item 1]
+- [Item 2]"""
         
         if max_length:
-            prompt += f"\n\nPlease keep your entire response under {max_length} characters."
+            prompt += f"\n\nKeep response under {max_length} characters."
             
         # Generate summary using Gemma
         response = self._generate(prompt)
@@ -155,12 +260,12 @@ If there are no clear action items, you can omit that section. Focus on providin
             if not line:
                 continue
                 
-            if line.startswith('Summary:'):
+            if line.startswith('SUMMARY:'):
                 current_section = 'summary'
-                summary = line.replace('Summary:', '').strip()
-            elif line.startswith('Key Points:'):
+                summary = line.replace('SUMMARY:', '').strip()
+            elif line.startswith('KEY POINTS:'):
                 current_section = 'key_points'
-            elif line.startswith('Action Items:'):
+            elif line.startswith('ACTION ITEMS:'):
                 current_section = 'action_items'
             elif line.startswith('- ') and current_section in ['key_points', 'action_items']:
                 item = line.replace('- ', '').strip()
