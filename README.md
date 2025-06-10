@@ -33,7 +33,7 @@ pip install -r requirements.txt
 
 3. Pull the Gemma model using Ollama:
 ```bash
-ollama pull gemma:4b
+ollama pull gemma3:4b
 ```
 
 ## Usage
