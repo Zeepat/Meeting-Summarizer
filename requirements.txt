@@ -1,0 +1,10 @@
+transformers>=4.37.0
+datasets[audio]>=2.16.0
+accelerate>=0.27.0
+torch>=2.2.0
+torchaudio>=2.2.0
+numpy>=1.24.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+soundfile>=0.12.1
+librosa>=0.10.1 
